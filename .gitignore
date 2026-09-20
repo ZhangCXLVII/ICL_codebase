@@ -1,0 +1,140 @@
+# -----------------------------------------------------------------------------
+# Local datasets and generated dataset caches
+# -----------------------------------------------------------------------------
+/data/
+**/datasets/
+**/*.zarr/
+**/*.zarr.zip
+**/*.h5
+**/*.hdf5
+**/*.parquet
+**/*.arrow
+**/*.npy
+**/*.npz
+**/*.pkl
+**/*.pickle
+**/*.mp4
+**/*.avi
+**/*.mov
+**/*.mkv
+**/*.tar
+**/*.tar.gz
+**/*.tgz
+**/*.zip
+**/*.7z
+
+# -----------------------------------------------------------------------------
+# Checkpoints, pretrained weights, and exported models
+# -----------------------------------------------------------------------------
+**/checkpoints/
+**/pretrained/
+**/pretrained_models/
+**/vision_encoder/
+**/*.ckpt
+**/*.pth
+**/*.pt
+**/*.bin
+**/*.safetensors
+**/*.onnx
+**/*.engine
+
+# -----------------------------------------------------------------------------
+# Experiment outputs and local logs
+# -----------------------------------------------------------------------------
+**/outputs/
+**/output/
+**/runs/
+**/wandb/
+**/logs/
+**/rollout_videos/
+**/test_outputs/
+**/cache/
+**/.cache/
+**/.hydra/
+**/multirun/
+**/lightning_logs/
+**/ray_results/
+**/profile_output*/
+events.out.tfevents.*
+slurm-*.out
+nohup.out
+*.pid
+*.log
+MUJOCO_LOG.TXT
+
+# -----------------------------------------------------------------------------
+# Downloaded third-party repositories and benchmark-only assets
+# Keep the baseline's own adapters/configs; omit vendored dependencies.
+# -----------------------------------------------------------------------------
+/policy/ICLR/LIBERO/
+/policy/ICLR/libero_config.yaml
+/policy/ICLR/.gitmodules
+/policy/BPP/deps/
+/policy/BPP/.gitmodules
+/policy/BPP/behavior_prompting/train_network/env/libero/
+
+# Large upstream examples/assets unrelated to Piper training and inference
+/policy/ICLR/notebooks/inference_iclr_libero_object.ipynb
+/policy/ICRT/assets/franka/
+/policy/BPP/assets/whiteboard_drawing_hardware/
+
+# -----------------------------------------------------------------------------
+# Python environments, caches, and build products
+# -----------------------------------------------------------------------------
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+site/
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+
+**/.venv/
+/venv/
+/env/
+/ENV/
+__pypackages__/
+.direnv/
+
+# -----------------------------------------------------------------------------
+# Local secrets and machine-specific configuration
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# -----------------------------------------------------------------------------
+# Editors, notebooks, operating-system files, and temporary files
+# -----------------------------------------------------------------------------
+**/.vscode/
+**/.idea/
+**/.ipynb_checkpoints/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.nfs*
+**/tmp/
+**/temp/
+
+# Local coding-agent state
+**/.agent/
+**/.agents/
+**/.codex/
