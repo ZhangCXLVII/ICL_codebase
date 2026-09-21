@@ -297,24 +297,30 @@ def get_grad_norm_(parameters, norm_type: float = 2.0) -> torch.Tensor:
     return total_norm
 
 
-def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
+def save_model(args, epoch=None, model=None, model_without_ddp=None, optimizer=None, loss_scaler=None, global_step=None):
     output_dir = Path(args.logging_cfg.output_dir)
-    epoch_name = str(epoch)
+    if global_step is not None:
+        checkpoint_name = f"checkpoint-step-{global_step:08d}"
+    else:
+        checkpoint_name = f"checkpoint-{epoch}"
     if loss_scaler is not None:
-        checkpoint_paths = [output_dir / ('checkpoint-%s.pth' % epoch_name)]
+        checkpoint_paths = [output_dir / f"{checkpoint_name}.pth"]
         for checkpoint_path in checkpoint_paths:
             to_save = {
                 'model': model_without_ddp.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'epoch': epoch,
                 'scaler': loss_scaler.state_dict(),
                 'args': args,
             }
+            if global_step is not None:
+                to_save['global_step'] = global_step
+            else:
+                to_save['epoch'] = epoch
 
             save_on_master(to_save, checkpoint_path)
     else:
-        client_state = {'epoch': epoch}
-        model.save_checkpoint(save_dir=args.logging_cfg.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
+        client_state = {'global_step': global_step} if global_step is not None else {'epoch': epoch}
+        model.save_checkpoint(save_dir=args.logging_cfg.output_dir, tag=checkpoint_name, client_state=client_state)
 
 
 def load_model(model_without_ddp, path):
@@ -349,9 +355,12 @@ def resume_from_ckpt(args : ExperimentConfig, model_without_ddp, optimizer, loss
             checkpoint = torch.load(args.shared_cfg.resume, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         print("Resume checkpoint %s" % args.shared_cfg.resume)
-        if 'optimizer' in checkpoint and 'epoch' in checkpoint and not (hasattr(args, 'eval') and args.eval):
+        if 'optimizer' in checkpoint and not (hasattr(args, 'eval') and args.eval):
             optimizer.load_state_dict(checkpoint['optimizer'])
-            args.shared_cfg.start_epoch = checkpoint['epoch'] + 1
+            if 'global_step' in checkpoint:
+                args.shared_cfg.start_step = checkpoint['global_step']
+            elif 'epoch' in checkpoint:
+                args.shared_cfg.start_epoch = checkpoint['epoch'] + 1
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
             print("With optim & sched!")

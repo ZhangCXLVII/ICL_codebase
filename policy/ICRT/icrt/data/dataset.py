@@ -28,29 +28,62 @@ class SequenceDataset(torch.utils.data.Dataset):
         split : str = "train",
         split_file : str = None, # path to the train val split file (json)
     ): 
-        # parse the dataset config 
+        # parse the dataset config
         dataset_json = load_json(dataset_config.dataset_json)
+        self.backend = dataset_json.get("backend", "hdf5")
 
-        # dataset_path: List of hdf5 paths
-        dataset_path = dataset_json["dataset_path"]
+        if self.backend == "lerobot_v3_piper":
+            from .lerobot_v3_adapter import LeRobotV3PiperAdapter
 
-        # hdf5_keys: List of hdf5 keys jsons (reading from hdf5 is slow, so we cached them)
-        hdf5_keys = dataset_json["hdf5_keys"]
-        
-        # assert the number of dataset_path and hdf5_keys are the same 
-        assert len(dataset_path) == len(hdf5_keys), "Number of dataset paths and hdf5 keys must match"
+            self.lerobot_adapter = LeRobotV3PiperAdapter(dataset_json, dataset_config.dataset_json)
+            self.hdf5_keys = self.lerobot_adapter.episode_ids.copy()
+            self.epi_len_mapping_json = self.lerobot_adapter.episode_lengths.copy()
+            self.verb_to_episode = defaultdict(list, self.lerobot_adapter.verb_to_episode)
+            self.keys_to_file = {}
+        elif self.backend == "hdf5":
+            # dataset_path: List of hdf5 paths
+            dataset_path = dataset_json["dataset_path"]
 
-        # create handles for the hdf5 files
-        hdf5_files = [h5py.File(h5_path, 'r') for h5_path in dataset_path]
-        
-        # load the hdf5_keys: list of keys for each hdf5 file
-        self.hdf5_keys = [load_json(f) for f in hdf5_keys]
+            # hdf5_keys: List of hdf5 keys jsons (reading from hdf5 is slow, so we cached them)
+            hdf5_keys = dataset_json["hdf5_keys"]
 
-        # keys to f: mapping from hdf5 keys to hdf5 files
-        self.keys_to_file = {}
-        for f, keys in zip(hdf5_files, self.hdf5_keys):
-            for k in keys:
-                self.keys_to_file[k] = f
+            # assert the number of dataset_path and hdf5_keys are the same
+            assert len(dataset_path) == len(hdf5_keys), "Number of dataset paths and hdf5 keys must match"
+
+            # create handles for the hdf5 files
+            hdf5_files = [h5py.File(h5_path, 'r') for h5_path in dataset_path]
+
+            # load the hdf5_keys: list of keys for each hdf5 file
+            self.hdf5_keys = [load_json(f) for f in hdf5_keys]
+
+            # keys to f: mapping from hdf5 keys to hdf5 files
+            self.keys_to_file = {}
+            for f, keys in zip(hdf5_files, self.hdf5_keys):
+                for k in keys:
+                    self.keys_to_file[k] = f
+
+            # now we can convert the hdf5_keys to a list of keys
+            self.hdf5_keys = [key for keys in self.hdf5_keys for key in keys]
+
+            # self.epi_len_mapping_json: mapping from hdf5 keys to episode length
+            epi_len_mapping_jsons = dataset_json["epi_len_mapping_json"]
+            self.epi_len_mapping_json = {}
+            if isinstance(epi_len_mapping_jsons, str):
+                epi_len_mapping_jsons = [epi_len_mapping_jsons]
+            for epi_len_mapping_json in epi_len_mapping_jsons:
+                self.epi_len_mapping_json.update(load_json(epi_len_mapping_json))
+
+            # self.verb_to_episode: mapping from verb to a list of hdf5 keys
+            verb_to_episode_jsons = dataset_json["verb_to_episode"]
+            self.verb_to_episode = defaultdict(list)
+            if isinstance(verb_to_episode_jsons, str):
+                verb_to_episode_jsons = [verb_to_episode_jsons]
+            for verb_to_episode_json in verb_to_episode_jsons:
+                verb_to_episode = load_json(verb_to_episode_json)
+                for k, v in verb_to_episode.items():
+                    self.verb_to_episode[k].extend(v)
+        else:
+            raise ValueError(f"Unknown dataset backend: {self.backend}")
 
         # shuffle repeat trajectory
         # if this is true, with half the chance the sequence of trajectories
@@ -59,33 +92,10 @@ class SequenceDataset(torch.utils.data.Dataset):
         if self.shuffle_repeat_traj:
             assert dataset_config.sort_by_lang, "Shuffle repeat trajectory only works with sort by lang"
 
-        # now we can convert the hdf5_keys to a list of keys
-        self.hdf5_keys = [key for keys in self.hdf5_keys for key in keys]
-
-        # self.epi_len_mapping_json: mapping from hdf5 keys to episode length
-        epi_len_mapping_jsons = dataset_json["epi_len_mapping_json"]
-        self.epi_len_mapping_json = {}
-        if isinstance(epi_len_mapping_jsons, str):
-            epi_len_mapping_jsons = [epi_len_mapping_jsons]
-        for epi_len_mapping_json in epi_len_mapping_jsons:
-            self.epi_len_mapping_json.update(load_json(epi_len_mapping_json))
-
         # filter episodes by their length 
         self.hdf5_keys = [
             key for key in self.hdf5_keys if self.minimum_length <= self.epi_len_mapping_json[key] <= self.maximum_length
         ]
-
-        # self.verb_to_episode: mapping from verb to a list of hdf5 keys
-        # making concatenation of dataset easier
-        verb_to_episode_jsons = dataset_json["verb_to_episode"]
-        self.verb_to_episode = defaultdict(list)
-        if isinstance(verb_to_episode_jsons, str):
-            verb_to_episode_jsons = [verb_to_episode_jsons]
-
-        for verb_to_episode_json in verb_to_episode_jsons:
-            verb_to_episode = load_json(verb_to_episode_json)
-            for k, v in verb_to_episode.items():
-                self.verb_to_episode[k].extend(v)
 
         # confine training to only a subset of tasks
         if dataset_config.task_names: 
@@ -437,10 +447,10 @@ class SequenceDataset(torch.utils.data.Dataset):
             else:
                 new_data_length = data_length // self.non_overlapping
 
-            if data_length<self.seq_length and data_length>0:
-                data_length = 1
+            if data_length > 0:
+                data_length = max(1, new_data_length)
             else:
-                data_length = new_data_length
+                data_length = 0
 
         return data_length
     
@@ -653,9 +663,12 @@ class SequenceDataset(torch.utils.data.Dataset):
         if self.rot_6d:
             ret = action[self.action_keys[0]]
             rot = ret[:, 3:]
-            rot = euler_to_rot_6d(rot)
-            ret = np.concatenate([ret[:, :3], rot], axis=-1)
-            action[self.action_keys[0]] = ret
+            if rot.shape[1] == 3:
+                rot = euler_to_rot_6d(rot)
+                ret = np.concatenate([ret[:, :3], rot], axis=-1)
+                action[self.action_keys[0]] = ret
+            elif rot.shape[1] != 6:
+                raise ValueError(f"Expected Euler (3) or rotation-6D (6) action, got {rot.shape[1]} rotation values")
             
         action_vec = np.concatenate([action[k] for k in self.action_keys], axis=-1)
         action_vec = torch.from_numpy(action_vec).float()
@@ -678,7 +691,13 @@ class SequenceDataset(torch.utils.data.Dataset):
                             norm = 255.0
                         else:
                             norm = 1.0
-                    subsequence = torch.from_numpy(subsequence / norm)
+                    subsequence = torch.from_numpy(subsequence)
+                    if dtype == 'uint8':
+                        # Avoid NumPy's float64 image expansion, which is very
+                        # costly for 512-step, two-camera LeRobot sequences.
+                        subsequence = subsequence.float().div_(norm)
+                    else:
+                        subsequence = subsequence.float()
                     # data aug for brightness and contrast 
                     if self.vision_aug:
                         contrast = np.random.uniform(self.contrast_range[0], self.contrast_range[1])
@@ -716,6 +735,9 @@ class SequenceDataset(torch.utils.data.Dataset):
         Returns:
             np.ndarray, the data from the demo
         """
+        if self.backend == "lerobot_v3_piper":
+            return self.lerobot_adapter.get(demo_id, key, seq_begin_index, seq_end_index)
+
         # obtain the hdf5 file handle
         f_handle = self.keys_to_file[demo_id]
         # get the data from the hdf5 file

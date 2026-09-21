@@ -1,6 +1,7 @@
 from pathlib import Path
 import datetime
 import json
+import math
 import numpy as np
 import os
 import time
@@ -10,17 +11,196 @@ import yaml
 
 import torch
 import torch.backends.cudnn as cudnn
-from torch.utils.tensorboard import SummaryWriter
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 
 import timm
 from timm.data.loader import MultiEpochsDataLoader
 from icrt.data.dataset import SequenceDataset
 
 import icrt.util.misc as misc
+from icrt.util import lr_sched
 from icrt.util.misc import NativeScalerWithGradNormCount as NativeScaler
 from icrt.util.args import ExperimentConfig
 from icrt.util.engine import train_one_epoch
 from icrt.util.model_constructor import model_constructor
+
+
+def _make_step_dataloaders(args, dataset_train, dataset_val, cycle, num_tasks, global_rank):
+    """Reshuffle demonstrations and create one finite data cycle."""
+    dataset_train.shuffle_dataset(cycle)
+    dataset_val.shuffle_dataset(cycle)
+    sampler_train = misc.DistributedSubEpochSampler(
+        dataset_train, num_replicas=num_tasks, rank=global_rank, split_epoch=1, shuffle=True
+    )
+    sampler_val = misc.DistributedSubEpochSampler(
+        dataset_val, num_replicas=num_tasks, rank=global_rank, split_epoch=1, shuffle=False
+    )
+    sampler_train.set_epoch(cycle)
+    sampler_val.set_epoch(cycle)
+    train_loader = MultiEpochsDataLoader(
+        dataset_train,
+        sampler=sampler_train,
+        batch_size=args.shared_cfg.batch_size,
+        num_workers=args.trainer_cfg.num_workers,
+        pin_memory=args.trainer_cfg.pin_memory,
+        drop_last=True,
+    )
+    val_loader = None
+    if len(sampler_val) >= args.shared_cfg.batch_size:
+        val_loader = MultiEpochsDataLoader(
+            dataset_val,
+            sampler=sampler_val,
+            batch_size=args.shared_cfg.batch_size,
+            num_workers=args.trainer_cfg.num_workers,
+            pin_memory=args.trainer_cfg.pin_memory,
+            drop_last=False,
+        )
+    return train_loader, val_loader
+
+
+@torch.no_grad()
+def _validate_at_step(model, data_loader, device):
+    if data_loader is None:
+        return {}
+    model.eval()
+    totals = {}
+    count = 0
+    for dataset_item in data_loader:
+        for key, value in dataset_item.items():
+            dataset_item[key] = value.to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            loss, loss_dict = model(dataset_item)
+        values = {"loss": loss.item(), **{
+            key: value.item() if isinstance(value, torch.Tensor) else float(value)
+            for key, value in loss_dict.items()
+        }}
+        for key, value in values.items():
+            totals[key] = totals.get(key, 0.0) + value
+        count += 1
+    model.train()
+    return {key: misc.all_reduce_mean(value / max(count, 1)) for key, value in totals.items()}
+
+
+def _train_by_steps(
+    args,
+    model,
+    model_without_ddp,
+    optimizer,
+    loss_scaler,
+    dataset_train,
+    dataset_val,
+    device,
+    log_writer,
+    num_tasks,
+    global_rank,
+):
+    max_steps = args.trainer_cfg.max_train_steps
+    global_step = args.shared_cfg.start_step
+    accumulation = args.trainer_cfg.accum_iter
+    micro_step = 0
+    cycle = 0
+    optimizer.zero_grad()
+    model.train()
+    running = {}
+
+    print(f"Start step-based training at step {global_step}; target {max_steps} optimizer steps")
+    while global_step < max_steps:
+        train_loader, val_loader = _make_step_dataloaders(
+            args, dataset_train, dataset_val, cycle, num_tasks, global_rank
+        )
+        if len(train_loader) == 0:
+            raise RuntimeError("Training dataloader is empty")
+        print(f"Data cycle {cycle}: {len(train_loader)} micro-batches")
+
+        for dataset_item in train_loader:
+            if micro_step % accumulation == 0:
+                lr = lr_sched.adjust_learning_rate_step(optimizer, global_step, args)
+
+            for key, value in dataset_item.items():
+                dataset_item[key] = value.to(device, non_blocking=True)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                loss, loss_dict = model(dataset_item)
+
+            loss_value = loss.item()
+            if not math.isfinite(loss_value):
+                raise RuntimeError(f"Non-finite loss at global step {global_step}: {loss_value}")
+            values = {"loss": loss_value, **{
+                key: value.item() if isinstance(value, torch.Tensor) else float(value)
+                for key, value in loss_dict.items()
+            }}
+            for key, value in values.items():
+                running[key] = running.get(key, 0.0) + value
+
+            update_grad = (micro_step + 1) % accumulation == 0
+            loss_scaler(
+                loss / accumulation,
+                optimizer,
+                parameters=model.parameters(),
+                update_grad=update_grad,
+            )
+            micro_step += 1
+            if not update_grad:
+                continue
+
+            optimizer.zero_grad()
+            torch.cuda.synchronize()
+            global_step += 1
+            train_stats = {
+                key: misc.all_reduce_mean(value / accumulation)
+                for key, value in running.items()
+            }
+            running = {}
+
+            if global_step % args.trainer_cfg.log_every_steps == 0:
+                payload = {f"train/{key}": value for key, value in train_stats.items()}
+                payload.update({"train/lr": lr, "global_step": global_step})
+                if misc.is_main_process():
+                    if wandb.run is not None:
+                        wandb.log(payload, step=global_step)
+                    if log_writer is not None:
+                        for key, value in payload.items():
+                            if key != "global_step":
+                                log_writer.add_scalar(key, value, global_step)
+                    with open(os.path.join(args.logging_cfg.output_dir, "log.txt"), "a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(payload) + "\n")
+                print(f"step {global_step}/{max_steps} loss={train_stats['loss']:.6f} lr={lr:.3e}")
+
+            should_validate = (
+                global_step % args.trainer_cfg.validation_every_steps == 0 or global_step == max_steps
+            )
+            if should_validate:
+                val_stats = _validate_at_step(model, val_loader, device)
+                if val_stats and misc.is_main_process():
+                    payload = {f"val/{key}": value for key, value in val_stats.items()}
+                    payload["global_step"] = global_step
+                    if wandb.run is not None:
+                        wandb.log(payload, step=global_step)
+                    if log_writer is not None:
+                        for key, value in payload.items():
+                            if key != "global_step":
+                                log_writer.add_scalar(key, value, global_step)
+                    print(f"validation step {global_step}: {val_stats}")
+
+            should_save = global_step % args.trainer_cfg.save_every_steps == 0 or global_step == max_steps
+            if args.logging_cfg.output_dir and should_save:
+                misc.save_model(
+                    args=args,
+                    global_step=global_step,
+                    model=model,
+                    model_without_ddp=model_without_ddp,
+                    optimizer=optimizer,
+                    loss_scaler=loss_scaler,
+                )
+
+            if global_step >= max_steps:
+                if log_writer is not None:
+                    log_writer.flush()
+                return
+        cycle += 1
 
 def main(args : ExperimentConfig):
     misc.init_distributed_mode(args)
@@ -123,17 +303,51 @@ def main(args : ExperimentConfig):
     dataset_train.save_split(os.path.join(args.logging_cfg.output_dir, "train_split.json"))
     dataset_val.save_split(os.path.join(args.logging_cfg.output_dir, "val_split.json"))
 
-    # Start a wandb run with `sync_tensorboard=True`
+    # Step mode logs directly to W&B; legacy epoch mode can mirror TensorBoard.
     if global_rank == 0 and args.logging_cfg.log_name is not None:
-        wandb.init(entity="project_vit", project="icrt_lite", config=args, name=args.logging_cfg.log_name, sync_tensorboard=True)
+        wandb.init(
+            entity=args.logging_cfg.wandb_entity,
+            project=args.logging_cfg.wandb_project,
+            config=args,
+            name=args.logging_cfg.log_name,
+            sync_tensorboard=args.trainer_cfg.max_train_steps is None and SummaryWriter is not None,
+        )
+        if args.trainer_cfg.max_train_steps is not None:
+            wandb.define_metric("global_step")
+            wandb.define_metric("train/*", step_metric="global_step")
+            wandb.define_metric("val/*", step_metric="global_step")
 
     # SummaryWrite
-    if global_rank == 0 and args.logging_cfg.log_dir is not None:
+    if args.trainer_cfg.max_train_steps is not None:
+        # Step mode writes directly to W&B and JSONL with global_step.
+        log_writer = None
+    elif global_rank == 0 and args.logging_cfg.log_dir is not None and SummaryWriter is not None:
         os.makedirs(args.logging_cfg.log_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.logging_cfg.log_dir)
     else:
         log_writer = None
 
+    if args.trainer_cfg.max_train_steps is not None:
+        start_time = time.time()
+        _train_by_steps(
+            args=args,
+            model=model,
+            model_without_ddp=model_without_ddp,
+            optimizer=optimizer,
+            loss_scaler=loss_scaler,
+            dataset_train=dataset_train,
+            dataset_val=dataset_val,
+            device=device,
+            log_writer=log_writer,
+            num_tasks=num_tasks,
+            global_rank=global_rank,
+        )
+        total_time = time.time() - start_time
+        print("Training time {}".format(datetime.timedelta(seconds=int(total_time))))
+        return
+
+    if args.trainer_cfg.epochs is None:
+        raise ValueError("Set either --trainer-cfg.max-train-steps or --trainer-cfg.epochs")
     print(f"Start training for {args.trainer_cfg.epochs} epochs")
     start_time = time.time()
 

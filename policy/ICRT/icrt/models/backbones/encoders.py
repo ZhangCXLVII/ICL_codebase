@@ -124,7 +124,9 @@ class VisionEncoder(nn.Module):
         else:
             kwargs = {}
         if "cross-mae-rtx" in name:
-            self.model = timm.create_model("vit_base_patch16_224.mae", pretrained=pretrained, global_pool=global_pool, **kwargs)
+            # The supplied CrossMAE checkpoint is the complete pretrained
+            # encoder. Do not trigger a second download into timm's cache.
+            self.model = timm.create_model("vit_base_patch16_224.mae", pretrained=False, global_pool=global_pool, **kwargs)
             timm.models.load_checkpoint(self.model, name, strict=False)
         elif "dust3r" in name.lower():
             self.model = timm.create_model("vit_large_patch16_224", pretrained=False)

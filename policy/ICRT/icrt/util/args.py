@@ -168,10 +168,14 @@ class OptimizerConfig:
     # epochs to warmup LR
     warmup_epochs : float = 40
 
+    # optimizer-update steps to warm up in step-based training
+    warmup_steps : int = 200
+
 @dataclasses.dataclass
 class TrainerConfig:
     # number of epochs 
-    epochs : int = 400
+    # Legacy epoch mode only. Leave unset when max_train_steps is used.
+    epochs : Optional[int] = None
 
     # Accumulate gradient iterations (for increasing the effective batch size under memory constraints)
     accum_iter : int = 8
@@ -181,6 +185,14 @@ class TrainerConfig:
 
     # number of workers for dataloader 
     num_workers : int = 20 
+
+    # If set, train by optimizer-update steps and ignore epochs.
+    max_train_steps : Optional[int] = None
+
+    # Step-based validation, checkpoint, and logging intervals.
+    validation_every_steps : int = 250
+    save_every_steps : int = 500
+    log_every_steps : int = 1
 
 
 @dataclasses.dataclass
@@ -199,6 +211,9 @@ class SharedConfig:
     
     # start epoch 
     start_epoch : int = 0
+
+    # optimizer-update step restored by a step-based checkpoint
+    start_step : int = 0
 
     # frequency of saving checkpoint 
     save_every : int = 5
@@ -234,6 +249,10 @@ class LoggingConfig:
 
     # log name (for wandb)
     log_name : Optional[str] = None
+
+    # wandb project and optional account/team entity
+    wandb_project : str = "icrt"
+    wandb_entity : Optional[str] = None
 
 @dataclasses.dataclass
 class ExperimentConfig: 

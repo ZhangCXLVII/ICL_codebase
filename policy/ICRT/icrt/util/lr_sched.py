@@ -20,3 +20,20 @@ def adjust_learning_rate(optimizer, epoch : int, args : ExperimentConfig):
         else:
             param_group["lr"] = lr
     return lr
+
+
+def adjust_learning_rate_step(optimizer, step: int, args: ExperimentConfig):
+    """Warm up and cosine-decay by optimizer-update step."""
+    total_steps = args.trainer_cfg.max_train_steps
+    warmup_steps = min(args.optimizer_cfg.warmup_steps, total_steps)
+    if warmup_steps > 0 and step < warmup_steps:
+        lr = args.optimizer_cfg.lr * (step + 1) / warmup_steps
+    else:
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = min(1.0, max(0.0, (step - warmup_steps) / decay_steps))
+        lr = args.optimizer_cfg.min_lr + (args.optimizer_cfg.lr - args.optimizer_cfg.min_lr) * 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr * param_group.get("lr_scale", 1.0)
+    return lr

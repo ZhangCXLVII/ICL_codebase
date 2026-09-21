@@ -1,0 +1,22 @@
+{
+    "backend": "lerobot_v3_piper",
+    "dataset_path": "../../../data/pick_and_place_the_black_block_lerobot_v3/pick_and_place_the_black_block",
+    "urdf_path": "../assets/piper/piper_description.urdf",
+    "base_link": "base_link",
+    "end_link": "link6",
+    "target_fps": 15,
+    "video_decode_short_side": 256,
+    "train_split": 0.9,
+    "action_keys": [
+        "action/cartesian_position",
+        "action/gripper_position"
+    ],
+    "image_keys": [
+        "observation.images.third",
+        "observation.images.wrist"
+    ],
+    "proprio_keys": [
+        "observation/cartesian_position",
+        "observation/gripper_position"
+    ]
+}
