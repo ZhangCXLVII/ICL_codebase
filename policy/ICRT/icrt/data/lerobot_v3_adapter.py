@@ -217,7 +217,7 @@ class LeRobotV3PiperAdapter:
 
             cleaned_rows = rows
             # DATA CLEANING: comment out this one line for already-clean future recordings.
-            cleaned_rows = trim_trailing_duplicate_action_timestamps(rows, action_timestamps)
+            # cleaned_rows = trim_trailing_duplicate_action_timestamps(rows, action_timestamps)
 
             trimmed += len(rows) - len(cleaned_rows)
             sampled_rows = cleaned_rows[:: self.frame_stride]
@@ -311,8 +311,12 @@ class LeRobotV3PiperAdapter:
         container = self._video_container(key)
         stream = container.streams.video[0]
         fps = float(stream.average_rate)
-        decoded = {}
         wanted = [int(index) for index in global_indices]
+        positions = {}
+        for position, frame_index in enumerate(wanted):
+            positions.setdefault(frame_index, []).append(position)
+        decoded_indices = set()
+        output = None
         for run in self._contiguous_runs(wanted, self.frame_stride):
             wanted_in_run = set(run)
             seek_pts = int((run[0] / fps) / float(stream.time_base))
@@ -332,11 +336,17 @@ class LeRobotV3PiperAdapter:
                         (round(width * scale), round(height * scale)),
                         interpolation=cv2.INTER_AREA,
                     )
-                    decoded[frame_index] = resized
-        missing = sorted(set(wanted) - decoded.keys())
+                    if output is None:
+                        output = np.empty((len(wanted), *resized.shape), dtype=np.uint8)
+                    for position in positions[frame_index]:
+                        output[position] = resized
+                    decoded_indices.add(frame_index)
+        missing = sorted(set(wanted) - decoded_indices)
         if missing:
             raise RuntimeError(f"Missing {len(missing)} frames from {self.video_paths[key]}: {missing[:5]}")
-        return np.stack([decoded[index] for index in wanted], axis=0)
+        if output is None:
+            raise RuntimeError(f"No frames decoded from {self.video_paths[key]}")
+        return output
 
     def get(self, episode_id: str, key: str, begin: int, end: int) -> np.ndarray:
         rows = self.episode_rows[episode_id][begin : end + 1]

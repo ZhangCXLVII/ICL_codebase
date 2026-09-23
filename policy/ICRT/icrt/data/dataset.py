@@ -9,6 +9,23 @@ from .utils import euler_to_rot_6d, quat_to_rot_6d, euler_to_quat, load_json, co
 from icrt.util.args import DatasetConfig, SharedConfig
 from collections import defaultdict
 
+
+def _split_vision_transform(vision_transform):
+    """Separate geometry from normalization so resize/crop runs on uint8."""
+    geometry = []
+    normalize = None
+    for transform in vision_transform.transforms:
+        if isinstance(transform, transforms.Normalize):
+            normalize = transform
+        elif isinstance(transform, (transforms.ToTensor, transforms.ColorJitter)):
+            continue
+        elif transform.__class__.__name__ == "MaybeToTensor":
+            continue
+        else:
+            geometry.append(transform)
+    return transforms.Compose(geometry), normalize
+
+
 class SequenceDataset(torch.utils.data.Dataset):
     
     # set minimum trajectory length
@@ -169,11 +186,8 @@ class SequenceDataset(torch.utils.data.Dataset):
         if self.rebalance_tasks:
             assert self.sort_by_lang, "Rebalance tasks only works with sort by lang"
             # calculate median of the number of trajectories for each task
-            if self.split == "train": 
-                self.rebalance_length = int(np.median([len(i) for i in self.verb_to_episode.values()]))
-                # self.rebalance_length = int(np.quantile([len(i) for i in self.verb_to_episode.values()], 0.75)) # for droid pre-training
-            else:
-                self.rebalance_length = 5
+            self.rebalance_length = int(np.median([len(i) for i in self.verb_to_episode.values()]))
+            # self.rebalance_length = int(np.quantile([len(i) for i in self.verb_to_episode.values()], 0.75)) # for droid pre-training
             print("Each task is rebalanced to have length: ", self.rebalance_length)
 
         # define image, proprio, and action keys 
@@ -205,21 +219,25 @@ class SequenceDataset(torch.utils.data.Dataset):
         self.proprio_noise = dataset_config.proprio_noise
         self.action_noise = dataset_config.action_noise
     
-        # vision transform 
-        # we do not need normalization, see get_item
+        # Keep geometric transforms separate so full-resolution video batches
+        # stay uint8 until after resize/crop. This substantially lowers peak RAM.
         if vision_transform is not None:
-            self.vision_transform = transforms.Compose([t for t in vision_transform.transforms if not isinstance(t, transforms.ToTensor) and not isinstance(t, transforms.ColorJitter)])
+            self.vision_transform, self.vision_normalize = _split_vision_transform(vision_transform)
         else:
             print("warning: vision transforms are not defined. Using default transforms.")
             self.vision_transform = transforms.Compose([
                 transforms.Resize(size=248, max_size=None, interpolation=transforms.InterpolationMode.BICUBIC, antialias='warn'), # kept consistent with default
                 transforms.CenterCrop(size=224),
-                transforms.Normalize(mean=torch.tensor([0.4850, 0.4560, 0.4060]), std=torch.tensor([0.2290, 0.2240, 0.2250]))
             ])
+            self.vision_normalize = transforms.Normalize(
+                mean=torch.tensor([0.4850, 0.4560, 0.4060]),
+                std=torch.tensor([0.2290, 0.2240, 0.2250]),
+            )
         if no_aug_vision_transform is not None:
-            self.no_aug_vision_transform = transforms.Compose([t for t in no_aug_vision_transform.transforms if not isinstance(t, transforms.ToTensor) and not isinstance(t, transforms.ColorJitter)])
+            self.no_aug_vision_transform, self.no_aug_vision_normalize = _split_vision_transform(no_aug_vision_transform)
         else:
             self.no_aug_vision_transform = self.vision_transform
+            self.no_aug_vision_normalize = self.vision_normalize
         print("vision transforms")
         print(self.vision_transform)
         
@@ -678,43 +696,48 @@ class SequenceDataset(torch.utils.data.Dataset):
         """
         Load image data from the dataset
         """
-        image = {}
-        dtype = None
-        for k in self.image_keys:
-            data = []
+        total_frames = sum(e - s + 1 for ranges in start_end_epi.values() for s, e in ranges)
+        image_vec = None
+        for camera_index, k in enumerate(self.image_keys):
+            offset = 0
             for epi in start_end_epi:
                 for s, e in start_end_epi[epi]:
                     subsequence = self.get_key_from_demo(epi, k, s, e)
-                    if dtype is None:
-                        dtype = subsequence.dtype 
-                        if dtype == 'uint8':
-                            norm = 255.0
-                        else:
-                            norm = 1.0
-                    subsequence = torch.from_numpy(subsequence)
-                    if dtype == 'uint8':
-                        # Avoid NumPy's float64 image expansion, which is very
-                        # costly for 512-step, two-camera LeRobot sequences.
-                        subsequence = subsequence.float().div_(norm)
+                    is_uint8 = subsequence.dtype == np.uint8
+
+                    # Keep T,H,W,C video data uint8 through the spatial transform.
+                    subsequence = torch.from_numpy(subsequence).permute(0, 3, 1, 2)
+                    if "wrist" in k or "hand" in k:
+                        subsequence = self.no_aug_vision_transform(subsequence)
+                        normalize = self.no_aug_vision_normalize
                     else:
-                        subsequence = subsequence.float()
+                        subsequence = self.vision_transform(subsequence)
+                        normalize = self.vision_normalize
+
+                    subsequence = subsequence.float()
+                    if is_uint8:
+                        subsequence.div_(255.0)
                     # data aug for brightness and contrast 
                     if self.vision_aug:
                         contrast = np.random.uniform(self.contrast_range[0], self.contrast_range[1])
                         brightness = np.random.uniform(self.brightness_range[0], self.brightness_range[1])
-                        subsequence = contrast * subsequence + brightness
+                        subsequence.mul_(contrast).add_(brightness)
+                    if normalize is not None:
+                        subsequence = normalize(subsequence)
 
-                    # permute from T, H, W, C to T, C, H, W
-                    subsequence = subsequence.permute(0, 3, 1, 2)
-                    # transform each subsequence independently
-                    if "wrist" in k or "hand" in k:
-                        subsequence = self.no_aug_vision_transform(subsequence).float()
-                    else:
-                        subsequence = self.vision_transform(subsequence).float()
-                    data.append(subsequence)
-            image[k] = torch.cat(data, dim=0) # concat on the time axis 
-        
-        image_vec = torch.stack([image[k] for k in self.image_keys], dim=1).float()
+                    if image_vec is None:
+                        image_vec = torch.empty(
+                            (total_frames, len(self.image_keys), *subsequence.shape[1:]),
+                            dtype=torch.float32,
+                        )
+                    next_offset = offset + len(subsequence)
+                    image_vec[offset:next_offset, camera_index].copy_(subsequence)
+                    offset = next_offset
+            if offset != total_frames:
+                raise RuntimeError(f"Loaded {offset} frames for {k}, expected {total_frames}")
+
+        if image_vec is None:
+            raise RuntimeError("No image frames were loaded")
         return image_vec
     
     def get_key_from_demo(

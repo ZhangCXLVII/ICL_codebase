@@ -22,24 +22,23 @@ must have one task label. Datasets containing several labels are grouped by
 label automatically, and ICRT's task barrier prevents a context window from
 crossing between labels.
 
-## Temporary stale-tail cleaning
+## Stale-tail cleaning
 
-The current recording contains fixed-duration tails after the final fresh
-leader command. They are trimmed before 30 Hz to 15 Hz downsampling. The one
-call that enables this temporary cleanup is in
-`icrt/data/lerobot_v3_adapter.py`:
-
-```python
-cleaned_rows = trim_trailing_duplicate_action_timestamps(rows, action_timestamps)
-```
-
-For a future dataset that was cleaned during collection, comment out that line
-directly. The preceding `cleaned_rows = rows` line already supplies the
-unfiltered rows:
+The current `black_block_trimmed` recording was already cleaned from its saved
+valid ranges, so the temporary online cleanup call in
+`icrt/data/lerobot_v3_adapter.py` is commented out:
 
 ```python
 cleaned_rows = rows
 # cleaned_rows = trim_trailing_duplicate_action_timestamps(rows, action_timestamps)
+```
+
+For an older recording that still has fixed-duration stale tails, uncomment
+the second line directly:
+
+```python
+cleaned_rows = rows
+cleaned_rows = trim_trailing_duplicate_action_timestamps(rows, action_timestamps)
 ```
 
 This intentionally is not exposed as a configuration flag.
@@ -64,13 +63,14 @@ pip install -e .
 bash scripts/train_piper_black_block_4l.sh
 ```
 
-The script uses batch size 1. AV1 decoding workers can consume substantial CPU
-and memory, so adjust `--trainer-cfg.num-workers` for the training machine.
+The script uses batch size 1, `num_workers=0`, and unpinned host memory. A
+512-step two-camera float32 sample is about 588 MiB, so worker prefetching can
+consume several GiB on a 16 GiB WSL instance.
 
 Training is controlled by optimizer-update steps rather than epochs. With
 gradient accumulation set to 8, `global_step` advances after eight
 micro-batches. The default script trains for 4,000 updates, warms up for 200,
-validates every 250, saves every 500, and logs every optimizer update to the
+validates every 200, saves every 250, and logs every optimizer update to the
 `icrt-piper` W&B project against `global_step`.
 
 The step-based Piper path logs directly to W&B and does not require

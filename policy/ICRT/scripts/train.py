@@ -1,9 +1,11 @@
 from pathlib import Path
+import dataclasses
 import datetime
 import json
 import math
 import numpy as np
 import os
+import resource
 import time
 import tyro 
 import wandb
@@ -29,37 +31,50 @@ from icrt.util.engine import train_one_epoch
 from icrt.util.model_constructor import model_constructor
 
 
-def _make_step_dataloaders(args, dataset_train, dataset_val, cycle, num_tasks, global_rank):
-    """Reshuffle demonstrations and create one finite data cycle."""
+def _step_loader_kwargs(args):
+    kwargs = {
+        "batch_size": args.shared_cfg.batch_size,
+        "num_workers": args.trainer_cfg.num_workers,
+        "pin_memory": args.trainer_cfg.pin_memory,
+    }
+    if args.trainer_cfg.num_workers > 0:
+        # A sample contains 512 frames from two cameras. PyTorch's default
+        # prefetch factor of two can keep several ~600 MiB samples resident.
+        kwargs["prefetch_factor"] = 1
+        kwargs["persistent_workers"] = False
+    return kwargs
+
+
+def _make_step_train_dataloader(args, dataset_train, cycle, num_tasks, global_rank):
+    """Reshuffle demonstrations and create one finite training data cycle."""
     dataset_train.shuffle_dataset(cycle)
-    dataset_val.shuffle_dataset(cycle)
     sampler_train = misc.DistributedSubEpochSampler(
         dataset_train, num_replicas=num_tasks, rank=global_rank, split_epoch=1, shuffle=True
     )
+    sampler_train.set_epoch(cycle)
+    return torch.utils.data.DataLoader(
+        dataset_train,
+        sampler=sampler_train,
+        drop_last=True,
+        **_step_loader_kwargs(args),
+    )
+
+
+def _make_step_val_dataloader(args, dataset_val, cycle, num_tasks, global_rank):
+    """Create validation workers only when validation is actually requested."""
+    dataset_val.shuffle_dataset(cycle)
     sampler_val = misc.DistributedSubEpochSampler(
         dataset_val, num_replicas=num_tasks, rank=global_rank, split_epoch=1, shuffle=False
     )
-    sampler_train.set_epoch(cycle)
     sampler_val.set_epoch(cycle)
-    train_loader = MultiEpochsDataLoader(
-        dataset_train,
-        sampler=sampler_train,
-        batch_size=args.shared_cfg.batch_size,
-        num_workers=args.trainer_cfg.num_workers,
-        pin_memory=args.trainer_cfg.pin_memory,
-        drop_last=True,
-    )
-    val_loader = None
     if len(sampler_val) >= args.shared_cfg.batch_size:
-        val_loader = MultiEpochsDataLoader(
+        return torch.utils.data.DataLoader(
             dataset_val,
             sampler=sampler_val,
-            batch_size=args.shared_cfg.batch_size,
-            num_workers=args.trainer_cfg.num_workers,
-            pin_memory=args.trainer_cfg.pin_memory,
             drop_last=False,
+            **_step_loader_kwargs(args),
         )
-    return train_loader, val_loader
+    return None
 
 
 @torch.no_grad()
@@ -109,8 +124,8 @@ def _train_by_steps(
 
     print(f"Start step-based training at step {global_step}; target {max_steps} optimizer steps")
     while global_step < max_steps:
-        train_loader, val_loader = _make_step_dataloaders(
-            args, dataset_train, dataset_val, cycle, num_tasks, global_rank
+        train_loader = _make_step_train_dataloader(
+            args, dataset_train, cycle, num_tasks, global_rank
         )
         if len(train_loader) == 0:
             raise RuntimeError("Training dataloader is empty")
@@ -157,7 +172,13 @@ def _train_by_steps(
 
             if global_step % args.trainer_cfg.log_every_steps == 0:
                 payload = {f"train/{key}": value for key, value in train_stats.items()}
-                payload.update({"train/lr": lr, "global_step": global_step})
+                payload.update({
+                    "train/lr": lr,
+                    "system/process_peak_rss_gib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 ** 2),
+                    "system/cuda_allocated_gib": torch.cuda.memory_allocated(device) / (1024 ** 3),
+                    "system/cuda_reserved_gib": torch.cuda.memory_reserved(device) / (1024 ** 3),
+                    "global_step": global_step,
+                })
                 if misc.is_main_process():
                     if wandb.run is not None:
                         wandb.log(payload, step=global_step)
@@ -173,7 +194,11 @@ def _train_by_steps(
                 global_step % args.trainer_cfg.validation_every_steps == 0 or global_step == max_steps
             )
             if should_validate:
+                val_loader = _make_step_val_dataloader(
+                    args, dataset_val, cycle, num_tasks, global_rank
+                )
                 val_stats = _validate_at_step(model, val_loader, device)
+                del val_loader
                 if val_stats and misc.is_main_process():
                     payload = {f"val/{key}": value for key, value in val_stats.items()}
                     payload["global_step"] = global_step
@@ -289,10 +314,16 @@ def main(args : ExperimentConfig):
         no_aug_vision_transform=no_aug_vision_transform,
         split="train",
     )
+    val_dataset_config = dataclasses.replace(
+        args.dataset_cfg,
+        vision_aug=False,
+        proprio_noise=0.0,
+        action_noise=0.0,
+    )
     dataset_val = SequenceDataset(
-        dataset_config=args.dataset_cfg,
+        dataset_config=val_dataset_config,
         shared_config=args.shared_cfg,
-        vision_transform=vision_transform,
+        vision_transform=no_aug_vision_transform,
         no_aug_vision_transform=no_aug_vision_transform,
         split="val"
     )
